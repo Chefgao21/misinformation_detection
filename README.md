@@ -11,30 +11,53 @@ Complete fake news detection system with RAG pipeline and chain-of-thought expla
 pip install -r requirements.txt
 ```
 
-### 2. Start Redis
+### 2. Start Redis (Local)
 ```bash
 # Mac
-brew install redis
-brew services start redis
+brew install redis-stack
+brew services start redis-stack
 
 # Ubuntu
-sudo apt-get install redis-server
-sudo systemctl start redis-server
+sudo apt-get install redis-stack-server -y
+sudo systemctl start redis-stack-server
 
-# Verify
-redis-cli ping  
+# Verify Redis + RediSearch loaded
+redis-cli ping
+redis-cli module list  # should show "search" in the list
 ```
 
-### 3. Prepare Data
+### 2a. Start Redis (Google Colab)
+```bash
+!/opt/redis-stack/bin/redis-stack-server --daemonize yes
+!sleep 3
+!redis-cli ping
+```
+
+### 3. Authenticate with HuggingFace (for Llama explanations)
+```python
+from huggingface_hub import login
+login(token="your_hf_token_here")
+```
+Get your token at huggingface.co/settings/tokens (Read access).
+Accept Meta's license at huggingface.co/meta-llama/Llama-3.2-3B-Instruct.
+
+### 4. Prepare Data
 You need:
 - `train.tsv`, `valid.tsv`, `test.tsv` (LIAR dataset)
 - `fact_check_articles_averitec.csv` (AVeriTeC RAG articles)
 
-### 4. Run Training
+### 5. Run Training
 ```bash
-python debertav3_misinformation.py
+
+# LangChain + Redis RAG version
 python debertav3_langchain.py
 ```
+
+### 6. Check Outputs
+After training completes:
+- `best_model_langchain.pt` — saved model checkpoint
+- `explanations_langchain.json` — 5 sample predictions with explanations
+- `metrics_langchain.json` — accuracy, precision, recall, F1
 
 
 
@@ -60,7 +83,6 @@ Feed the statement, prediction, evidence, and speaker history into Llama 3.2 to 
 
 ```
 .
-├── derbtav3_misinformation.py            # Main training script
 ├── derbtav3_langchain.py                 # Main training script with langchain
 ├── requirements.txt                      # Dependencies
 ├── README.md                             
@@ -69,7 +91,7 @@ Feed the statement, prediction, evidence, and speaker history into Llama 3.2 to 
 ├── test.tsv                              # Test data
 ├── fact_check_articles_averitec.csv      # fact checking articles (AVeriTeC)
 ├── rag.py                                # Preprocess AVeriTeC for RAG
-├── rag.json                              # Postprocessed AVeriTeC 
+├── fact_check_articles_averitec.csv      # Postprocessed AVeriTeC 
 
 ```
 
@@ -81,7 +103,7 @@ Edit `Config` class in the script:
 class Config:
     MODEL_NAME = 'microsoft/deberta-v3-base'
     EXPLANATION_MODEL = 'meta-llama/Llama-3.2-3B-Instruct'
-    EPOCHS = 5
+    EPOCHS = 10
     BATCH_SIZE = 16
     TOP_K_RETRIEVAL = 3  # Number of articles to retrieve
 ```

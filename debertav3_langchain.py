@@ -1,3 +1,5 @@
+from huggingface_hub import login
+# login token here 
 import pandas as pd
 import numpy as np
 import torch
@@ -6,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, pipeline
 from sklearn.metrics import accuracy_score, classification_report, precision_recall_fscore_support
 from sklearn.utils.class_weight import compute_class_weight
+from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 import warnings
 import os
@@ -13,10 +16,10 @@ import json
 from typing import List, Dict, Tuple
 
 # LangChain imports
-from langchain.vectorstores import Redis as LangChainRedis
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.docstore.document import Document
-from langchain.schema import Document as LCDocument
+from langchain_community.vectorstores import Redis as LangChainRedis
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_core.documents import Document as LCDocument
 
 warnings.filterwarnings("ignore")
 
@@ -28,9 +31,9 @@ class Config:
     MAX_LEN = 256
     TRAIN_BATCH_SIZE = 16
     VALID_BATCH_SIZE = 16
-    EPOCHS = 5
-    LEARNING_RATE_BERT = 2e-5
-    LEARNING_RATE_CLF = 1e-3
+    EPOCHS = 10
+    LEARNING_RATE_BERT = 1e-5
+    LEARNING_RATE_CLF = 1e-4
     METADATA_DIM = 0
     NUM_CLASSES = 2
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -49,91 +52,136 @@ class Config:
 class LangChainRAGPipeline:
     
     def __init__(self, redis_url: str, embedding_model: str, index_name: str):
-        print(f"Initializing LangChain RAG pipeline")
+        print(f"Initializing RAG pipeline")
         try:
-            # Initialize embeddings
+            import redis
+            from redis.commands.search.field import VectorField, TextField
+            from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+            
             self.embeddings = HuggingFaceEmbeddings(
                 model_name=embedding_model,
                 model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'}
             )
-            print(f"Loaded embedding model: {embedding_model}")
             
-            # Initialize LangChain Redis vector store
-            self.vectorstore = LangChainRedis(
-                redis_url=redis_url,
-                index_name=index_name,
-                embedding=self.embeddings
-            )
+            self.redis_client = redis.from_url(redis_url)
+            self.redis_client.ping()
+            self.index_name = index_name
+            self.vector_dim = 384  # all-MiniLM-L6-v2 output dim
             print(f"Connected to Redis at {redis_url}")
             self.available = True
             
         except Exception as e:
-            print(f"Could not initialize LangChain RAG: {e}")
+            print(f"Could not initialize RAG: {e}")
             print("RAG features will be disabled")
             self.available = False
-            self.vectorstore = None
-    
+
+    def _create_index(self):
+        from redis.commands.search.field import VectorField, TextField
+        from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+        
+        try:
+            self.redis_client.ft(self.index_name).info()
+            print("Index already exists")
+        except:
+            schema = [
+                TextField("title"),
+                TextField("text"),
+                TextField("verdict"),
+                VectorField("embedding",
+                    "FLAT",
+                    {
+                        "TYPE": "FLOAT32",
+                        "DIM": self.vector_dim,
+                        "DISTANCE_METRIC": "COSINE"
+                    }
+                )
+            ]
+            definition = IndexDefinition(prefix=[f"{self.index_name}:"], index_type=IndexType.HASH)
+            self.redis_client.ft(self.index_name).create_index(schema, definition=definition)
+            print("Created Redis index")
+
     def index_articles(self, articles: List[Dict]):
         if not self.available:
             return
         
-        print(f"\nIndexing {len(articles)} articles with LangChain")
+        print(f"\nIndexing {len(articles)} articles")
+        self._create_index()
         
-        # Convert articles to LangChain Documents
-        documents = []
-        for article in tqdm(articles, desc="Preparing documents"):
-            # Combine title and text for content
-            content = f"{article['title']}\n\n{article['text']}"
-            
-            # Store other fields as metadata
-            metadata = {
-                'id': article['id'],
-                'title': article['title'],
-                'url': article.get('url', ''),
-                'verdict': article.get('verdict', '')
-            }
-            
-            doc = Document(page_content=content, metadata=metadata)
-            documents.append(doc)
+        import numpy as np
+        texts = [f"{a['title']}\n\n{a['text']}" for a in articles]
         
-        # Add all documents to vector store
-        print("Adding documents to vector store")
-        self.vectorstore.add_documents(documents)
-        print(f"Indexed {len(documents)} articles")
-    
+        # Embed in batches
+        batch_size = 64
+        all_embeddings = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="Embedding"):
+            batch = texts[i:i+batch_size]
+            embs = self.embeddings.embed_documents(batch)
+            all_embeddings.extend(embs)
+        
+        # Store in Redis
+        pipe = self.redis_client.pipeline()
+        for i, (article, embedding) in enumerate(tqdm(zip(articles, all_embeddings), desc="Storing", total=len(articles))):
+            key = f"{self.index_name}:{article['id']}"
+            embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
+            pipe.hset(key, mapping={
+                "title": article['title'][:200],
+                "text": article['text'][:500],
+                "verdict": article.get('verdict', ''),
+                "id": article['id'],
+                "embedding": embedding_bytes
+            })
+            if i % 100 == 0:
+                pipe.execute()
+                pipe = self.redis_client.pipeline()
+        pipe.execute()
+        print(f"Indexed {len(articles)} articles")
+
     def search(self, query: str, top_k: int = 3) -> List[Dict]:
         if not self.available:
             return []
         
-        # Use LangChain's similarity search with scores
-        results = self.vectorstore.similarity_search_with_score(query, k=top_k)
-        
-        # Convert LangChain results to our format
-        formatted_results = []
-        for doc, score in results:
-            formatted_results.append({
-                'text': doc.page_content,
-                'title': doc.metadata.get('title', ''),
-                'url': doc.metadata.get('url', ''),
-                'verdict': doc.metadata.get('verdict', ''),
-                'id': doc.metadata.get('id', ''),
-                'similarity': float(1 - score)  # Convert distance to similarity
-            })
-        
-        return formatted_results
-    
+        try:
+            import numpy as np
+            from redis.commands.search.query import Query
+            
+            query_embedding = self.embeddings.embed_query(query)
+            query_vector = np.array(query_embedding, dtype=np.float32).tobytes()
+            
+            q = (
+                Query(f"*=>[KNN {top_k} @embedding $vec AS score]")
+                .sort_by("score")
+                .return_fields("title", "text", "verdict", "id", "score")
+                .paging(0, top_k)
+                .dialect(2)
+            )
+            
+            results = self.redis_client.ft(self.index_name).search(
+                q, query_params={"vec": query_vector}
+            )
+            
+            formatted = []
+            for doc in results.docs:
+                formatted.append({
+                    'text': getattr(doc, 'text', ''),
+                    'title': getattr(doc, 'title', ''),
+                    'verdict': getattr(doc, 'verdict', ''),
+                    'id': getattr(doc, 'id', ''),
+                    'similarity': 1 - float(getattr(doc, 'score', 1))
+                })
+            return formatted
+            
+        except Exception as e:
+            print(f"Search error: {e}")
+            return []
+
     def clear_index(self):
         if not self.available:
             return
         try:
-            import redis
-            redis_client = redis.from_url(Config.REDIS_URL)
-            keys = redis_client.keys(f"{Config.INDEX_NAME}*")
-            if keys:
-                redis_client.delete(*keys)
-            print(f"Cleared index: {Config.INDEX_NAME}")
-        except Exception as e:
-            print(f"Could not clear index: {e}")
+            self.redis_client.ft(self.index_name).dropindex(delete_documents=True)
+            print(f"Cleared index: {self.index_name}")
+        except:
+            print("Index didn't exist yet, skipping clear")
 
 
 # 3. DATA PREPARATION
@@ -246,7 +294,7 @@ class EnhancedMisinformationDataset(Dataset):
         meta = self.metadata[idx]
         label = self.labels[idx]
         
-        encoding = self.tokenizer.encode_plus(
+        encoding = self.tokenizer(
             text,
             add_special_tokens=True,
             max_length=self.max_len,
@@ -384,6 +432,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step() 
         
         total_loss += loss.item()
         _, predicted = torch.max(outputs, 1)
@@ -477,7 +526,6 @@ def eval_with_explanations(model, dataloader, df, contexts, explainer, device, n
     return all_labels, all_preds, explanations
 
 
-
 # 8. MAIN
 if __name__ == "__main__":
     print("ENHANCED MISINFORMATION DETECTION - LANGCHAIN VERSION")
@@ -519,6 +567,11 @@ if __name__ == "__main__":
     valid_texts, valid_meta, valid_y, valid_ctx = preprocess_features_with_langchain(valid_df, tokenizer, rag_pipeline)
     test_texts, test_meta, test_y, test_ctx = preprocess_features_with_langchain(test_df, tokenizer, rag_pipeline)
     
+    print("NaN in train_meta:", np.isnan(train_meta).any())
+    print("NaN in train_y:", np.isnan(train_y.astype(float)).any())
+    print("Meta shape:", train_meta.shape)
+    print("Meta sample:", train_meta[0])  
+
     Config.METADATA_DIM = train_meta.shape[1]
     
     train_ds = EnhancedMisinformationDataset(train_texts, train_meta, train_y, tokenizer, Config.MAX_LEN)
@@ -537,10 +590,18 @@ if __name__ == "__main__":
     weights = compute_class_weight('balanced', classes=np.unique(train_y), y=train_y)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float).to(Config.DEVICE))
     
+
     optimizer = torch.optim.AdamW([
         {'params': [p for n, p in model.named_parameters() if 'bert' in n], 'lr': Config.LEARNING_RATE_BERT},
         {'params': [p for n, p in model.named_parameters() if 'bert' not in n], 'lr': Config.LEARNING_RATE_CLF}
-    ])
+    ], eps=1e-6)
+
+    total_steps = len(train_loader) * Config.EPOCHS
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=total_steps // 10,
+        num_training_steps=total_steps
+    )
     
     best_val_loss = float('inf')
     
@@ -555,7 +616,7 @@ if __name__ == "__main__":
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), 'best_model_langchain.pt')
-            print("✓ Saved")
+            print("Saved")
     
     # Evaluate
     print("STEP 4: EVALUATE")
@@ -564,7 +625,7 @@ if __name__ == "__main__":
     explainer = ExplanationGenerator()
     
     true_labels, preds, explanations = eval_with_explanations(
-        model, test_loader, test_df, test_ctx, explainer, Config.DEVICE, n=10
+        model, test_loader, test_df, test_ctx, explainer, Config.DEVICE, n=5
     )
     
     acc = accuracy_score(true_labels, preds)
@@ -578,20 +639,16 @@ if __name__ == "__main__":
     
     print("\n" + classification_report(true_labels, preds, target_names=['Unreliable', 'Reliable']))
     
-    # Save
-    with open('explanations_langchain.json', 'w') as f:
-        json.dump(explanations, f, indent=2)
     
-    with open('metrics_langchain.json', 'w') as f:
-        json.dump({
-            'accuracy': float(acc),
-            'precision': float(prec),
-            'recall': float(rec),
-            'f1': float(f1),
-            'framework': 'LangChain'
-        }, f, indent=2)
-    
-
     print("COMPLETE - LANGCHAIN VERSION")
  
-    print("Files: best_model_langchain.pt, explanations_langchain.json, metrics_langchain.json")
+    print("\n SAMPLE EXPLANATIONS ")
+    for i, exp in enumerate(explanations):
+        print(f"\nExample {i+1}")
+        print(f"Statement:   {exp['statement']}")
+        print(f"Speaker:     {exp['speaker']}")
+        print(f"True Label:  {exp['true_label']}")
+        print(f"Predicted:   {exp['predicted']}")
+        print(f"Confidence:  {exp['confidence']:.1%}")
+        print(f"Evidence:    {exp['retrieved']}")
+        print(f"Explanation: {exp['explanation']}")

@@ -53,12 +53,6 @@ You need:
 python debertav3_langchain.py
 ```
 
-### 6. Check Outputs
-After training completes:
-- `best_model_langchain.pt` — saved model checkpoint
-- `explanations_langchain.json` — 5 sample predictions with explanations
-- `metrics_langchain.json` — accuracy, precision, recall, F1
-
 
 
 ## Architecture
@@ -89,7 +83,7 @@ Feed the statement, prediction, evidence, and speaker history into Llama 3.2 to 
 ├── train.tsv                             # Training data (LIAR)
 ├── valid.tsv                             # Validation data
 ├── test.tsv                              # Test data
-├── fact_check_articles_averitec.csv      # fact checking articles (AVeriTeC)
+├── AVeriTeC_train.json                   # fact checking articles (AVeriTeC)
 ├── rag.py                                # Preprocess AVeriTeC for RAG
 ├── fact_check_articles_averitec.csv      # Postprocessed AVeriTeC 
 
